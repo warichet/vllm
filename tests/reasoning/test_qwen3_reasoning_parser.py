@@ -9,6 +9,7 @@ from tests.reasoning.utils import (
     run_reasoning_extraction,
     run_reasoning_extraction_streaming,
 )
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 
 parser_name = "qwen3"
@@ -58,12 +59,14 @@ WITH_THINK_STREAM = {
     "content": "This is the rest",
 }
 
-# --- No think tokens at all (thinking disabled) ---
+# --- No think tokens at all (thinking enabled, truncated) ---
 
+# With thinking enabled (default), no think tokens means the output was
+# truncated before </think> could be generated. All output is reasoning.
 WITHOUT_THINK = {
     "output": "This is the rest",
-    "reasoning": None,
-    "content": "This is the rest",
+    "reasoning": "This is the rest",
+    "content": None,
 }
 # In streaming, the parser cannot distinguish "thinking disabled" from
 # "reasoning in progress" when no think tokens have appeared yet.
@@ -73,6 +76,25 @@ WITHOUT_THINK_STREAM = {
     "output": "This is the rest",
     "reasoning": "This is the rest",
     "content": None,
+}
+
+# --- <tool_call> without </think> (implicit reasoning end) ---
+
+TOOL_CALL_BODY = (
+    "<tool_call>\n<function=bash>\n<parameter=command>"
+    "\ncat /etc/hosts\n</parameter>\n</function>\n</tool_call>"
+)
+
+TOOL_CALL_NO_THINK_END = {
+    "output": "I need to read the file.\n\n" + TOOL_CALL_BODY,
+    "reasoning": "I need to read the file.\n\n",
+    "content": TOOL_CALL_BODY,
+}
+
+TOOL_CALL_WITH_THINK_NO_END = {
+    "output": "<think>I need to read the file.\n\n" + TOOL_CALL_BODY,
+    "reasoning": "I need to read the file.\n\n",
+    "content": TOOL_CALL_BODY,
 }
 
 # --- Edge cases ---
@@ -87,14 +109,30 @@ MULTILINE_REASONING = {
     "reasoning": "This is a reasoning\nsection",
     "content": "This is the rest\nThat",
 }
+# Truncated output: <think> present but no </think> (thinking enabled).
+# Everything is reasoning because the output was cut off mid-thought.
 ONLY_OPEN_TAG = {
     "output": "<think>This is a reasoning section",
-    "reasoning": None,
-    "content": "This is a reasoning section",
+    "reasoning": "This is a reasoning section",
+    "content": None,
 }
 
 ONLY_OPEN_TAG_STREAM = {
     "output": "<think>This is a reasoning section",
+    "reasoning": "This is a reasoning section",
+    "content": None,
+}
+
+# Truncated output without <think> prefix (Qwen3.5 style where <think>
+# is in the prompt). No </think> means truncation — all is reasoning.
+TRUNCATED_NO_START_TOKEN = {
+    "output": "This is a reasoning section",
+    "reasoning": "This is a reasoning section",
+    "content": None,
+}
+
+TRUNCATED_NO_START_TOKEN_STREAM = {
+    "output": "This is a reasoning section",
     "reasoning": "This is a reasoning section",
     "content": None,
 }
@@ -170,6 +208,36 @@ TEST_CASES = [
         ONLY_OPEN_TAG_STREAM,
         id="only_open_tag_stream",
     ),
+    pytest.param(
+        False,
+        TRUNCATED_NO_START_TOKEN,
+        id="truncated_no_start_token",
+    ),
+    pytest.param(
+        True,
+        TRUNCATED_NO_START_TOKEN_STREAM,
+        id="truncated_no_start_token_stream",
+    ),
+    pytest.param(
+        False,
+        TOOL_CALL_NO_THINK_END,
+        id="tool_call_no_think_end",
+    ),
+    pytest.param(
+        True,
+        TOOL_CALL_NO_THINK_END,
+        id="tool_call_no_think_end_stream",
+    ),
+    pytest.param(
+        False,
+        TOOL_CALL_WITH_THINK_NO_END,
+        id="tool_call_with_think_no_end",
+    ),
+    pytest.param(
+        True,
+        TOOL_CALL_WITH_THINK_NO_END,
+        id="tool_call_with_think_no_end_stream",
+    ),
 ]
 
 
@@ -226,6 +294,13 @@ MULTI_TOKEN_DELTA_CASES = [
         "content",
         id="no_start_end_grouped_with_content",
     ),
+    pytest.param(
+        # <tool_call> arrives in a separate delta after reasoning text
+        ["I need to read the file.\n\n", "<tool_call>\n<function=bash>"],
+        "I need to read the file.\n\n",
+        "<tool_call>\n<function=bash>",
+        id="tool_call_implicit_reasoning_end",
+    ),
 ]
 
 
@@ -249,3 +324,52 @@ def test_reasoning_streaming_multi_token_deltas(
 
     assert reconstructor.reasoning == expected_reasoning
     assert (reconstructor.other_content or None) == expected_content
+
+
+# --- Tests for enable_thinking=False (thinking explicitly disabled) ---
+
+
+THINKING_DISABLED_CASES = [
+    pytest.param(
+        "This is plain content",
+        None,
+        "This is plain content",
+        id="thinking_disabled_plain_content",
+    ),
+    pytest.param(
+        "Some output without think tokens",
+        None,
+        "Some output without think tokens",
+        id="thinking_disabled_no_think_tokens",
+    ),
+    pytest.param(
+        "I need to read the file.\n\n" + TOOL_CALL_BODY,
+        None,
+        "I need to read the file.\n\n" + TOOL_CALL_BODY,
+        id="thinking_disabled_with_tool_call",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "output, expected_reasoning, expected_content", THINKING_DISABLED_CASES
+)
+def test_reasoning_thinking_disabled(
+    output: str,
+    expected_reasoning: str | None,
+    expected_content: str | None,
+    qwen3_tokenizer,
+):
+    """When enable_thinking=False, output without </think> is all content."""
+    parser: ReasoningParser = ReasoningParserManager.get_reasoning_parser(parser_name)(
+        qwen3_tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    reasoning, content = parser.extract_reasoning(
+        model_output=output,
+        request=ChatCompletionRequest(messages=[], model="test-model"),
+    )
+
+    assert reasoning == expected_reasoning
+    assert content == expected_content
